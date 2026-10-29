@@ -3,26 +3,40 @@ _base_ = ['../../../_base_/default_runtime.py']
 custom_imports = dict(imports=[
     'mmpose.models.backbones.custom_csp_darknet',
     'mmpose.models.necks.custom_hybrid_encoder',
+    'mmpose.engine.hooks.custom_compatible_pretrained_hook',
 ])
 
 # 训练运行参数
-train_cfg = dict(max_epochs=600, val_interval=20, dynamic_intervals=[(580, 1)])
+max_epochs = 200
+num_last_epochs = 20
+rtmo_attribute_epoch = int(max_epochs * 280 / 600)
+train_cfg = dict(
+    max_epochs=max_epochs,
+    val_interval=10,
+    dynamic_intervals=[(max_epochs - num_last_epochs, 1)])
 
 auto_scale_lr = dict(base_batch_size=256)
 
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', interval=40, max_keep_ckpts=3))
+    checkpoint=dict(type='CheckpointHook', interval=20, max_keep_ckpts=3))
 
 optim_wrapper = dict(
-    type='OptimWrapper',
+    # 使用动态 loss scale 的混合精度训练，降低显存占用并提高吞吐。
+    type='AmpOptimWrapper',
+    loss_scale='dynamic',
     constructor='ForceDefaultOptimWrapperConstructor',
-    optimizer=dict(type='AdamW', lr=0.004, weight_decay=0.05),
+    # 单卡 batch=32，相对原配置总 batch=256 按比例缩放基础学习率。
+    optimizer=dict(type='AdamW', lr=0.0005, weight_decay=0.05),
     paramwise_cfg=dict(
         norm_decay_mult=0,
         bias_decay_mult=0,
         bypass_duplicate=True,
         force_default_settings=True,
-        custom_keys=dict({'neck.encoder': dict(lr_mult=0.05)})),
+        custom_keys=dict({
+            'backbone': dict(lr_mult=0.1),
+            'neck': dict(lr_mult=1.0),
+            'head': dict(lr_mult=1.0),
+        })),
     clip_grad=dict(max_norm=0.1, norm_type=2))
 
 param_scheduler = [
@@ -34,23 +48,18 @@ param_scheduler = [
         convert_to_iter_based=True),
     dict(
         type='CosineAnnealingLR',
-        eta_min=0.0002,
+        eta_min=0.000025,
         begin=5,
-        T_max=280,
-        end=280,
+        T_max=max_epochs - num_last_epochs - 5,
+        end=max_epochs - num_last_epochs,
         by_epoch=True,
         convert_to_iter_based=True),
-    # 将学习率从 2e-4 提升到 5e-4
-    dict(type='ConstantLR', by_epoch=True, factor=2.5, begin=280, end=281),
     dict(
-        type='CosineAnnealingLR',
-        eta_min=0.0002,
-        begin=281,
-        T_max=300,
-        end=580,
+        type='ConstantLR',
         by_epoch=True,
-        convert_to_iter_based=True),
-    dict(type='ConstantLR', by_epoch=True, factor=1, begin=580, end=600),
+        factor=1,
+        begin=max_epochs - num_last_epochs,
+        end=max_epochs),
 ]
 
 # 数据配置
@@ -194,14 +203,20 @@ test_evaluator = dict(
 # 训练钩子
 custom_hooks = [
     dict(
+        type='CustomCompatiblePretrainedHook',
+        checkpoint='RTMO/rtmo-s_8xb32-600e_body7-640x640-'
+        'dac2bf74_20231211.pth',
+        prefixes=('backbone.', 'neck.', 'head.'),
+        priority=48),
+    dict(
         type='YOLOXPoseModeSwitchHook',
-        num_last_epochs=20,
+        num_last_epochs=num_last_epochs,
         new_train_pipeline=train_pipeline_stage2,
         priority=48),
     dict(
         type='RTMOModeSwitchHook',
         epoch_attributes={
-            280: {
+            rtmo_attribute_epoch: {
                 'proxy_target_cc': True,
                 'loss_mle.loss_weight': 5.0,
                 'loss_oks.loss_weight': 10.0
@@ -251,13 +266,7 @@ model = dict(
         spp_kernal_sizes=(5, 9, 13),
         norm_cfg=dict(type='BN', momentum=0.03, eps=0.001),
         act_cfg=dict(type='LeakyReLU', negative_slope=0.1),
-        init_cfg=dict(
-            type='Pretrained',
-            checkpoint='https://download.openmmlab.com/mmdetection/v2.0/'
-            'yolox/yolox_s_8x8_300e_coco/yolox_s_8x8_300e_coco_'
-            '20211121_095711-4592a793.pth',
-            prefix='backbone.',
-        )),
+    ),
     neck=dict(
         type='CustomHybridEncoder',
         in_channels=[128, 256, 512],
