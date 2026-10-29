@@ -7,7 +7,7 @@ custom_imports = dict(imports=[
 ])
 
 # 训练运行参数
-max_epochs = 200
+max_epochs = 300
 num_last_epochs = 20
 rtmo_attribute_epoch = int(max_epochs * 280 / 600)
 train_cfg = dict(
@@ -18,7 +18,12 @@ train_cfg = dict(
 auto_scale_lr = dict(base_batch_size=256)
 
 default_hooks = dict(
-    checkpoint=dict(type='CheckpointHook', interval=20, max_keep_ckpts=3))
+    checkpoint=dict(
+        type='CheckpointHook',
+        interval=20,
+        max_keep_ckpts=3,
+        save_best='coco/AP',
+        rule='greater'))
 
 optim_wrapper = dict(
     # 使用动态 loss scale 的混合精度训练，降低显存占用并提高吞吐。
