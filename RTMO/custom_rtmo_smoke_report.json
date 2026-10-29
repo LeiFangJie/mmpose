@@ -1,0 +1,101 @@
+{
+  "input_shape": [
+    1,
+    3,
+    640,
+    640
+  ],
+  "raw_max_abs_error": {
+    "cls_s16": 0.1484375,
+    "bbox_s16": 0.1484375,
+    "vis_s16": 0.1806640625,
+    "pose_s16": 0.21484375,
+    "cls_s32": 0.259765625,
+    "bbox_s32": 0.36328125,
+    "vis_s32": 0.3173828125,
+    "pose_s32": 0.4296875
+  },
+  "raw_max_abs_error_all": 0.4296875,
+  "raw_relative_error": {
+    "cls_s16": 2.183979088055393e-06,
+    "bbox_s16": 3.96351190936241e-06,
+    "vis_s16": 3.4087008766589043e-06,
+    "pose_s16": 3.2453547172705976e-06,
+    "cls_s32": 9.353379101597389e-06,
+    "bbox_s32": 4.737722726458562e-06,
+    "vis_s32": 2.733898381619643e-06,
+    "pose_s32": 3.110737269618798e-06
+  },
+  "torch_postprocess_instances": 1638,
+  "onnx_postprocess_instances": 1638,
+  "matches_source_instance_count": true,
+  "source_output": {
+    "bboxes": [
+      1638,
+      4
+    ],
+    "scores": [
+      1638
+    ],
+    "keypoints": [
+      1638,
+      17,
+      2
+    ],
+    "keypoint_scores": [
+      1638,
+      17
+    ]
+  },
+  "torch_output": {
+    "bboxes": [
+      1638,
+      4
+    ],
+    "scores": [
+      1638
+    ],
+    "keypoints": [
+      1638,
+      17,
+      2
+    ],
+    "keypoint_scores": [
+      1638,
+      17
+    ]
+  },
+  "postprocess_max_abs_error": {
+    "bboxes": 0.802734375,
+    "scores": 0.0,
+    "keypoints": null,
+    "keypoint_scores": 0.007072761654853821
+  },
+  "postprocess_finite_max_abs_error": {
+    "bboxes": 0.802734375,
+    "scores": 0.0,
+    "keypoints": 2.6571930707310195e+26,
+    "keypoint_scores": 0.007072761654853821
+  },
+  "dcc_probe_max_abs_error": 0.0007476806640625,
+  "onnx_output": {
+    "bboxes": [
+      1638,
+      4
+    ],
+    "scores": [
+      1638
+    ],
+    "keypoints": [
+      1638,
+      17,
+      2
+    ],
+    "keypoint_scores": [
+      1638,
+      17
+    ]
+  },
+  "onnx": "RTMO\\custom_rtmo_private_raw_opset9.onnx",
+  "dcc_parameters": "RTMO\\custom_rtmo_dcc_params.npz"
+}
