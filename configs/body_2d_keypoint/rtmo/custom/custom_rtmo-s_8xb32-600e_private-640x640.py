@@ -269,6 +269,7 @@ model = dict(
         widen_factor=widen_factor,
         out_indices=(2, 3, 4),
         spp_kernal_sizes=(5, 9, 13),
+        spp_mode='conv',
         norm_cfg=dict(type='BN', momentum=0.03, eps=0.001),
         act_cfg=dict(type='LeakyReLU', negative_slope=0.1),
     ),

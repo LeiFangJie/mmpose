@@ -7,6 +7,7 @@ from torch.nn.modules import GroupNorm
 from torch.nn.modules.batchnorm import _BatchNorm
 
 from mmpose.models.backbones.custom_csp_darknet import (CustomCSPDarknet,
+                                                         ConvSPPBottleneck,
                                                          SPPBottleneck)
 
 
@@ -27,6 +28,44 @@ def check_norm_state(modules, train_state):
 
 
 class TestCSPDarknetBackbone(unittest.TestCase):
+
+    def test_conv_spp_uses_parallel_depthwise_convolution_branches(self):
+        module = ConvSPPBottleneck(
+            in_channels=8,
+            out_channels=8,
+            kernel_sizes=(5, 9, 13),
+            norm_cfg=None,
+            act_cfg=None)
+
+        self.assertEqual(len(module.poolings), 3)
+        self.assertFalse(any(isinstance(layer, torch.nn.MaxPool2d)
+                             for layer in module.modules()))
+        self.assertEqual(
+            [sum(conv.kernel_size[0] - 1 for conv in branch
+                 if isinstance(conv, torch.nn.Conv2d)) + 1
+             for branch in module.poolings],
+            [5, 9, 13])
+        for branch in module.poolings:
+            for conv in branch:
+                self.assertIsInstance(conv, torch.nn.Conv2d)
+                self.assertEqual(conv.groups, conv.in_channels)
+                self.assertEqual(conv.in_channels, conv.out_channels)
+
+        outputs = module(torch.randn(1, 8, 17, 17))
+        self.assertEqual(outputs.shape, torch.Size((1, 8, 17, 17)))
+
+    def test_custom_backbone_can_select_conv_spp(self):
+        model = CustomCSPDarknet(
+            widen_factor=0.25,
+            out_indices=(4,),
+            spp_mode='conv',
+            norm_cfg=None,
+            act_cfg=None)
+
+        spp = model.stage4[1]
+        self.assertIsInstance(spp, ConvSPPBottleneck)
+        self.assertFalse(any(isinstance(layer, torch.nn.MaxPool2d)
+                             for layer in spp.modules()))
 
     def test_spp_large_kernel_decomposition_matches_reference(self):
         module = SPPBottleneck(

@@ -152,6 +152,99 @@ class SPPBottleneck(BaseModule):
         return x
 
 
+class ConvSPPBottleneck(BaseModule):
+    """使用并行 depthwise 卷积分支替代 MaxPool 的 SPP 模块。
+
+    每个分支只使用 5x5 或 3x3 depthwise Conv2d。多个卷积串联后形成
+    5、9、13 的有效感受野，保持原 SPP 的多尺度并行结构，同时避免导出
+    MaxPool 算子。新分支没有旧池化权重对应项，需要在私有数据上微调。
+    """
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_sizes=(5, 9, 13),
+                 conv_cfg=None,
+                 norm_cfg=dict(type='BN', momentum=0.03, eps=0.001),
+                 act_cfg=dict(type='Swish'),
+                 init_cfg=None):
+        super().__init__(init_cfg)
+        mid_channels = in_channels // 2
+        self.conv1 = ConvModule(
+            in_channels,
+            mid_channels,
+            1,
+            stride=1,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg)
+        self.poolings = nn.ModuleList([
+            self._build_conv_branch(mid_channels, kernel_size)
+            for kernel_size in kernel_sizes
+        ])
+        conv2_channels = mid_channels * (len(kernel_sizes) + 1)
+        self.conv2 = ConvModule(
+            conv2_channels,
+            out_channels,
+            1,
+            conv_cfg=conv_cfg,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg)
+
+    @staticmethod
+    def _build_conv_branch(channels, kernel_size):
+        """构建给定有效感受野的 depthwise 卷积串联分支。"""
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError('SPP 卷积分支的 kernel_size 必须是正奇数')
+
+        remaining_kernel = kernel_size
+        layers = []
+        while remaining_kernel > 5:
+            layers.append(
+                nn.Conv2d(
+                    channels,
+                    channels,
+                    kernel_size=5,
+                    stride=1,
+                    padding=2,
+                    groups=channels,
+                    bias=False))
+            remaining_kernel -= 4
+        if remaining_kernel == 5:
+            layers.append(
+                nn.Conv2d(
+                    channels,
+                    channels,
+                    kernel_size=5,
+                    stride=1,
+                    padding=2,
+                    groups=channels,
+                    bias=False))
+        elif remaining_kernel == 3:
+            layers.append(
+                nn.Conv2d(
+                    channels,
+                    channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    groups=channels,
+                    bias=False))
+
+        branch = nn.Sequential(*layers)
+        for layer in branch:
+            nn.init.dirac_(layer.weight, groups=channels)
+        return branch
+
+    def forward(self, x):
+        """执行卷积版 SPP 的并行多尺度特征融合。"""
+        x = self.conv1(x)
+        with torch.cuda.amp.autocast(enabled=False):
+            x = torch.cat(
+                [x] + [pooling(x) for pooling in self.poolings], dim=1)
+        return self.conv2(x)
+
+
 @MODELS.register_module(name='CustomCSPDarknet')
 class CustomCSPDarknet(BaseModule):
     """CSP-Darknet backbone used in YOLOv5 and YOLOX.
@@ -172,6 +265,8 @@ class CustomCSPDarknet(BaseModule):
         arch_ovewrite(list): Overwrite default arch settings. Default: None.
         spp_kernal_sizes: (tuple[int]): Sequential of kernel sizes of SPP
             layers. Default: (5, 9, 13).
+        spp_mode (str): SPP implementation, either ``maxpool`` or ``conv``.
+            Default: ``maxpool``.
         conv_cfg (dict): Config dict for convolution layer. Default: None.
         norm_cfg (dict): Dictionary to construct and config norm layer.
             Default: dict(type='BN', requires_grad=True).
@@ -215,6 +310,7 @@ class CustomCSPDarknet(BaseModule):
                  use_depthwise=False,
                  arch_ovewrite=None,
                  spp_kernal_sizes=(5, 9, 13),
+                 spp_mode='maxpool',
                  conv_cfg=None,
                  norm_cfg=dict(type='BN', momentum=0.03, eps=0.001),
                  act_cfg=dict(type='Swish'),
@@ -241,6 +337,9 @@ class CustomCSPDarknet(BaseModule):
         self.frozen_stages = frozen_stages
         self.use_depthwise = use_depthwise
         self.norm_eval = norm_eval
+        if spp_mode not in ('maxpool', 'conv'):
+            raise ValueError('spp_mode 必须是 maxpool 或 conv')
+        self.spp_mode = spp_mode
         conv = DepthwiseSeparableConvModule if use_depthwise else ConvModule
 
         self.stem = Focus(
@@ -269,7 +368,9 @@ class CustomCSPDarknet(BaseModule):
                 act_cfg=act_cfg)
             stage.append(conv_layer)
             if use_spp:
-                spp = SPPBottleneck(
+                spp_class = (ConvSPPBottleneck
+                             if spp_mode == 'conv' else SPPBottleneck)
+                spp = spp_class(
                     out_channels,
                     out_channels,
                     kernel_sizes=spp_kernal_sizes,

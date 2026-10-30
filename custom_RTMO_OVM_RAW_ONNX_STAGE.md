@@ -14,7 +14,7 @@
 此外，原始网络还有几项与目标算子约束不匹配的结构：
 
 - Focus 的步长切片在 opset 9 中不能直接导出为带 `steps` 的 Slice；
-- SPP 使用 9x9、13x13 MaxPool，超过手册对 MaxPool 的核大小限制；
+- SPP 的三路多尺度分支使用 5x5、5x5 串联、5x5 串联三次的 depthwise Conv，避免板端 MaxPool 导入限制；
 - RTMO pose 分支默认使用分组卷积，组数不符合手册中 Conv 的 Group=1 或 Group=C 限制；
 - PyTorch ONNX 导出器会为共享卷积参数生成多个无计算意义的 Identity 直通节点。
 
@@ -23,8 +23,8 @@
 本阶段建立一条独立的 `custom_` 导出路径，用于生成可审查的 raw ONNX 图：
 
 1. 关闭 neck attention，仅保留 FPN/PAN 特征融合；
-2. 将 Focus 部署路径导出为四维 `Reshape+Transpose+Reshape`，并重排 stem Conv 权重保持数值等价；
-3. 将超过限制的 SPP 大核池化拆分为等效的小核 MaxPool；
+2. 将 Focus 部署路径融合为等价的 7x7、stride=2 普通 Conv，并重排 stem Conv 权重保持数值等价；
+3. 保留三路并行 SPP 感受野，将 MaxPool 替换为普通 depthwise Conv 分支；
 4. 将 pose 分支改为 Group=1；
 5. 直接导出两尺度的分类、框、可见度和 pose feature 原始张量；
 6. 将 DCC、NMS 和所有预测后处理留在 ONNX 图外；
@@ -62,8 +62,10 @@
 - `mmpose/models/backbones/custom_csp_darknet.py`
   - 新增 `CustomCSPDarknet` 注册类；
   - 保留 Focus 训练实现；
-  - 将大于手册限制的 SPP 池化核拆分为多个 5x5/3x3 MaxPool；
-  - 保持原始 SPP 的有效感受野和 Max 运算语义。
+  - 新增 `ConvSPPBottleneck`，三路分支的有效感受野分别为 5、9、13；
+  - 每路使用 5x5 depthwise Conv 串联，实际图中不再出现 MaxPool；
+  - 通过 `spp_mode='conv'` 只在私有部署配置启用，默认 backbone 仍保留原实现；
+  - 卷积版 SPP 不是 Max 运算的数学等价替换，新增分支需要重新微调恢复精度。
 
 - `mmpose/models/necks/custom_hybrid_encoder.py`
   - 新增 `CustomHybridEncoder` 注册类；
@@ -82,8 +84,8 @@
 - `tools/deploy/rtmo/custom_export_raw_onnx.py`
   - 固定输入为 `[1, 3, 640, 640]`；
   - 固定导出 opset 9，不使用 dynamic axes；
-  - 使用两次四维 `Reshape` 和两次 `Transpose` 完成 Focus 空间到通道的重排；
-  - 对 stem Conv 权重进行通道重排，将导出路径的 `[TL, TR, BL, BR]` 映射到源码的 `[TL, BL, TR, BR]`；
+  - 使用等价的 7x7、stride=2 Conv 完成 Focus 空间到通道的重排；
+  - 对 stem Conv 权重进行空间相位重排，将导出路径的 `[TL, TR, BL, BR]` 映射到源码的 `[TL, BL, TR, BR]`；
   - 直接调用 head module 的分类、框、可见度和 pose feature 分支；
   - 不调用 `RTMOHead.predict()`，因此 DCC、NMS 和解码不进入图；
   - 导出后自动消除 Identity 节点并重新运行 ONNX checker 和审计。
@@ -107,13 +109,13 @@
 - `docs/superpowers/specs/custom_2026-10-28-rtmo-ovm-raw-export-design.md`
 - `docs/superpowers/plans/custom_2026-10-28-rtmo-ovm-raw-export.md`
 
-测试覆盖 attention 关闭、SPP 等效性、pose 分支分组、Focus/Reshape-Transpose 数值一致性、Identity 删除、raw 输出 shape 和算子审计。
+测试覆盖 attention 关闭、卷积 SPP 三路感受野和 depthwise 约束、pose 分支分组、Focus 数值一致性、Identity 删除、raw 输出 shape 和算子审计。
 
 ## 5. 最终 ONNX 输出契约
 
 最终 ONNX 文件为：
 
-`RTMO/custom_rtmo_private_raw_opset9.onnx`
+`RTMO/custom_rtmo_private_raw_opset9_conv_spp.onnx`
 
 输入：
 
@@ -138,38 +140,40 @@
 
 ## 6. 冒烟测试结果
 
-使用随机初始化的 smoke checkpoint：
+使用仓库中的 RTMO-S checkpoint 做结构 smoke 验证：
 
-`RTMO/custom_rtmo_random_smoke.pth`
+`RTMO/rtmo-s_8xb32-600e_body7-640x640-dac2bf74_20231211.pth`
 
 执行了完整流程：
 
 1. 加载自定义配置和 checkpoint；
 2. 构建 `CustomCSPDarknet`、`CustomHybridEncoder` 和 RTMO head；
-3. 执行 `switch_to_deploy()`；
-4. 导出 opset 9 ONNX；
-5. 删除 66 个 Identity 节点；
-6. 执行 ONNX checker 和静态算子审计；
-7. 使用 ONNX Runtime 检查输出 shape 和数值。
+3. 按名称和 shape 兼容加载 checkpoint；
+4. 执行 `switch_to_deploy()`；
+5. 导出 opset 9 ONNX；
+6. 删除导出产生的 Identity 节点；
+7. 执行 ONNX checker 和静态算子审计；
+8. 使用 ONNX Runtime 检查输出 shape 和数值。
 
 审计报告为：
 
-`RTMO/custom_rtmo_private_raw_opset9_audit.json`
+`RTMO/custom_rtmo_private_raw_opset9_conv_spp_audit.json`
+
+同一模型实例导出后与 ONNX Runtime 的 raw 数值对照报告为：
+
+`RTMO/custom_rtmo_private_raw_opset9_conv_spp_parity.json`
 
 最终图的主要算子计数如下：
 
 ```text
-Conv=80
+Conv=86
 LeakyRelu=67
-MaxPool=6
+MaxPool=0
 Upsample=2
 Slice=4
 Concat=9
 Add=11
-Constant=4
-Reshape=2
-Transpose=2
-Slice=4
+Constant=2
 Identity=0
 ```
 
@@ -183,12 +187,16 @@ Identity=0
 - NMS/DCC/attention 指示节点：无；
 - Conv 分组问题：无；
 - MaxPool/Upsample 属性问题：无；
-- ONNX Runtime 与 PyTorch wrapper 最大绝对误差：约 `2.1e-3`；
-- 自定义回归测试：18 passed。
+- 卷积版 SPP 三路分支的实际 kernel 均为 5x5，groups 等于通道数；
+- Focus 融合卷积仍为既定部署路径的 7x7 Conv，审计将其作为大核 warning 单独报告；
+- 同一模型实例的 PyTorch/ONNX raw 最大绝对误差为 `0.0234375`；
+- 自定义回归测试：backbone 11 passed，raw export 7 passed；
+- 本次旧 checkpoint 的卷积 SPP 新参数和不匹配的 pose 分支参数保持初始化，不能据此判断训练精度。
 
 ## 7. 当前边界
 
-- 当前 ONNX 使用随机 smoke checkpoint，不能代表私有训练模型的精度；
+- 当前 ONNX 使用原始 RTMO-S checkpoint 做结构 smoke，不能代表卷积 SPP 私有训练模型的精度；
+- 卷积 SPP 分支没有原 MaxPool 权重，必须在私有数据上重新微调；
 - pose branch 结构从默认分组卷积改为 Group=1，已有旧 pose-head 权重不能直接视为完全兼容，需要重新训练或微调；
 - 本阶段只验证 ONNX 静态图和本地 ONNX Runtime 数值语义，没有执行 NPUC 或板端编译；
 - 完成私有数据训练后，应使用真实 checkpoint 重新执行导出命令和审计命令，并保存新的 `custom_` ONNX 与审计报告。
@@ -199,7 +207,7 @@ Identity=0
 C:\Users\admin\miniforge3\envs\rtmpose\python.exe tools/deploy/rtmo/custom_export_raw_onnx.py `
   --config configs/body_2d_keypoint/rtmo/custom/custom_rtmo-s_8xb32-600e_private-640x640.py `
   --checkpoint <训练完成的checkpoint> `
-  --output RTMO/custom_rtmo_private_raw_opset9.onnx `
+  --output RTMO/custom_rtmo_private_raw_opset9_conv_spp.onnx `
   --audit
 ```
 
@@ -207,7 +215,7 @@ C:\Users\admin\miniforge3\envs\rtmpose\python.exe tools/deploy/rtmo/custom_expor
 
 ```powershell
 C:\Users\admin\miniforge3\envs\rtmpose\python.exe tools/deploy/rtmo/custom_onnx_audit.py `
-  RTMO/custom_rtmo_private_raw_opset9.onnx
+  RTMO/custom_rtmo_private_raw_opset9_conv_spp.onnx
 ```
 
 ## 9. 前处理与后处理
@@ -287,11 +295,11 @@ DCC 的 NumPy 参数必须由**正在部署的同一个训练 checkpoint**导出
 & 'C:\Users\admin\miniforge3\envs\rtmpose\python.exe' tools/deploy/rtmo/custom_export_raw_onnx.py `
   --config configs/body_2d_keypoint/rtmo/custom/custom_rtmo-s_8xb32-600e_private-640x640.py `
   --checkpoint <训练完成的checkpoint> `
-  --output RTMO/custom_rtmo_private_raw_opset9.onnx `
+  --output RTMO/custom_rtmo_private_raw_opset9_conv_spp.onnx `
   --audit
 ```
 
-成功后应检查 `RTMO/custom_rtmo_private_raw_opset9_audit.json`，确认输入仍为 `[1,3,640,640]`、八个输出 shape 和顺序符合第 5 节契约，opset 为 9，`Identity=0`，未列出算子和违反项均为空。
+成功后应检查 `RTMO/custom_rtmo_private_raw_opset9_conv_spp_audit.json`，确认输入仍为 `[1,3,640,640]`、八个输出 shape 和顺序符合第 5 节契约，opset 为 9，`MaxPool=0`、`Identity=0`，未列出算子和违反项均为空。
 
 ### 10.4 导出同 checkpoint 的 DCC 参数并完成联调
 
@@ -301,7 +309,7 @@ DCC 的 NumPy 参数必须由**正在部署的同一个训练 checkpoint**导出
 & 'C:\Users\admin\miniforge3\envs\rtmpose\python.exe' RTMO/custom_rtmo_smoke_test.py `
   --config configs/body_2d_keypoint/rtmo/custom/custom_rtmo-s_8xb32-600e_private-640x640.py `
   --checkpoint <与ONNX相同的训练checkpoint> `
-  --onnx RTMO/custom_rtmo_private_raw_opset9.onnx `
+  --onnx RTMO/custom_rtmo_private_raw_opset9_conv_spp.onnx `
   --image <用于联调的真实测试图像> `
   --dcc-params RTMO/custom_rtmo_dcc_params.npz `
   --report RTMO/custom_rtmo_smoke_report.json

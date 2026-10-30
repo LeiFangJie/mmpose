@@ -9,7 +9,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 from mmengine.config import Config
-from mmengine.runner import load_checkpoint
+from mmengine.runner.checkpoint import CheckpointLoader
 from mmengine.utils import import_modules_from_strings
 
 from mmpose.registry import MODELS
@@ -144,6 +144,51 @@ class RTMORawExportWrapper(nn.Module):
         return tuple(outputs)
 
 
+def load_compatible_checkpoint(model: nn.Module, checkpoint_path: str):
+    """按名称和 shape 加载兼容权重，跳过结构改写后的参数。
+
+    参数:
+        model: 已按当前导出配置构建的模型。
+        checkpoint_path: 训练 checkpoint 路径。
+
+    返回:
+        dict: 加载数量、形状不匹配数量和当前模型缺失数量。
+
+    旧 RTMO-S checkpoint 不包含卷积版 SPP 分支，且默认 pose 分支的
+    分组卷积形状不同。逐项过滤可以让这些参数保留当前模型初始化值，
+    同时继续复用可兼容的 backbone、neck 和 head 权重。
+    """
+    checkpoint = CheckpointLoader.load_checkpoint(
+        checkpoint_path, map_location='cpu')
+    source_state = checkpoint.get('state_dict', checkpoint)
+    model_state = model.state_dict()
+    compatible_state = {}
+    loaded_count = 0
+    shape_mismatch_count = 0
+    missing_count = 0
+    for key, value in source_state.items():
+        if key not in model_state:
+            missing_count += 1
+            continue
+        if not torch.is_tensor(value) or value.shape != model_state[key].shape:
+            shape_mismatch_count += 1
+            continue
+        compatible_state[key] = value
+        loaded_count += 1
+    model.load_state_dict(compatible_state, strict=False)
+    report = {
+        'loaded': loaded_count,
+        'shape_mismatch': shape_mismatch_count,
+        'missing_in_model': missing_count,
+    }
+    print(
+        '兼容加载 checkpoint: '
+        f"{loaded_count} 个参数已加载, "
+        f"{shape_mismatch_count} 个 shape 不匹配, "
+        f"{missing_count} 个参数在当前模型中不存在")
+    return report
+
+
 def parse_args():
     """解析导出命令行参数。"""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -164,7 +209,7 @@ def main():
         imports=custom_imports.get('imports', []),
         allow_failed_imports=custom_imports.get('allow_failed_imports', False))
     model = MODELS.build(config.model)
-    load_checkpoint(model, args.checkpoint, map_location='cpu')
+    load_compatible_checkpoint(model, args.checkpoint)
     model.eval()
     model.switch_to_deploy()
 
@@ -211,6 +256,12 @@ def main():
             from custom_onnx_audit import audit_onnx
         report = audit_onnx(output_path)
         print(json.dumps(report, indent=2, ensure_ascii=False))
+        audit_path = output_path.with_name(
+            f'{output_path.stem}_audit.json')
+        audit_path.write_text(
+            json.dumps(report, indent=2, ensure_ascii=False),
+            encoding='utf-8')
+        print(f'审计报告已写入: {audit_path}')
         if not report['static_onnx_contract_passed']:
             sys.exit(1)
 
