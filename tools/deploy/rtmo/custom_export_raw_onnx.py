@@ -31,35 +31,69 @@ class RTMORawExportWrapper(nn.Module):
         super().__init__()
         self.model = model
         self.input_size = tuple(input_size)
-        self._focus_conv = self._build_focus_conv(model.backbone.stem)
+        self._focus_conv = self._build_fused_focus_conv(model.backbone.stem)
 
     @staticmethod
-    def _build_focus_conv(focus: nn.Module) -> nn.Module:
-        """复制 Focus 卷积，并将权重改排为导出重排的通道顺序。"""
+    def _build_fused_focus_conv(focus: nn.Module) -> nn.Module:
+        """把 Focus 重排和 3x3 卷积精确合并为首层 7x7 卷积。"""
         conv_module = copy.deepcopy(focus.conv)
-        conv = conv_module.conv
-        in_channels = conv.in_channels // 4
-        # 四维 Reshape/Transpose 路径按 [TL, TR, BL, BR] 分组，转换成原
-        # Focus 的 [TL, BL, TR, BR] 分组顺序。
-        focus_offset_order = (0, 2, 1, 3)
-        order = [focus_offset_order[offset] * in_channels + channel
-                 for offset in range(4)
-                 for channel in range(in_channels)]
-        index = torch.tensor(order, dtype=torch.long, device=conv.weight.device)
+        source_conv = conv_module.conv
+        if not isinstance(source_conv, nn.Conv2d):
+            raise TypeError('Focus stem 必须使用 nn.Conv2d')
+        if (source_conv.kernel_size != (3, 3)
+                or source_conv.stride != (1, 1)
+                or source_conv.padding != (1, 1)
+                or source_conv.dilation != (1, 1)
+                or source_conv.groups != 1
+                or source_conv.padding_mode != 'zeros'):
+            raise ValueError('Focus stem 仅支持 3x3、stride=1、padding=1 的普通卷积')
+
+        input_channels = focus.conv.conv.in_channels // 4
+        if source_conv.in_channels != input_channels * 4:
+            raise ValueError('Focus stem 输入通道数必须是原图通道数的 4 倍')
+        fused_conv = nn.Conv2d(
+            input_channels,
+            source_conv.out_channels,
+            kernel_size=7,
+            stride=2,
+            padding=3,
+            bias=source_conv.bias is not None,
+            padding_mode=source_conv.padding_mode,
+            device=source_conv.weight.device,
+            dtype=source_conv.weight.dtype)
+
+        # 在 7x7 核左上预留一行一列零，使其和 6x6、padding=2 的等价卷积对齐。
         with torch.no_grad():
-            conv.weight.copy_(conv.weight.index_select(1, index))
+            fused_conv.weight.zero_()
+            source_weight = source_conv.weight
+            for offset_index, (offset_y, offset_x) in enumerate(
+                    ((0, 0), (1, 0), (0, 1), (1, 1))):
+                for kernel_y in range(3):
+                    for kernel_x in range(3):
+                        target_y = 2 * kernel_y + offset_y + 1
+                        target_x = 2 * kernel_x + offset_x + 1
+                        channel_start = offset_index * input_channels
+                        channel_end = channel_start + input_channels
+                        fused_conv.weight[:, :, target_y, target_x].copy_(
+                            source_weight[:, channel_start:channel_end,
+                                          kernel_y, kernel_x])
+            if source_conv.bias is not None:
+                fused_conv.bias.copy_(source_conv.bias)
+
+        conv_module.conv = fused_conv
         return conv_module
 
     def _run_focus(self, images: torch.Tensor) -> torch.Tensor:
-        """用四维 Reshape/Transpose 完成 Focus 的空间到通道重排。"""
-        batch, channels, height, width = images.shape
-        half_height = height // 2
-        half_width = width // 2
-        reordered = images.permute(0, 3, 1, 2).reshape(
-            batch, half_width, 2 * channels * half_height, 2)
-        reordered = reordered.permute(0, 3, 2, 1).reshape(
-            batch, 4 * channels, half_height, half_width)
-        return self._focus_conv(reordered)
+        """直接运行等价卷积，避免首节点为 Permute。"""
+        return self._focus_conv(images)
+
+    @staticmethod
+    def _split_class_pose_features(feature: torch.Tensor):
+        """按通道拆分分类与姿态特征，并为 ONNX Slice 指定有限结束索引。"""
+        channel_count = feature.shape[1]
+        half_channels = channel_count // 2
+        return (feature[:, :half_channels],
+                feature[:, half_channels:channel_count])
 
     @property
     def backbone(self):
@@ -91,9 +125,7 @@ class RTMORawExportWrapper(nn.Module):
         cls_outputs, bbox_outputs = [], []
         visibility_outputs, pose_outputs = [], []
         for level, feature in enumerate(features):
-            half_channels = feature.shape[1] // 2
-            cls_feature = feature[:, :half_channels]
-            pose_feature = feature[:, half_channels:]
+            cls_feature, pose_feature = self._split_class_pose_features(feature)
             cls_feature = head_module.conv_cls[level](cls_feature)
             pose_feature = head_module.conv_pose[level](pose_feature)
             cls_outputs.append(head_module.out_cls[level](cls_feature))

@@ -83,7 +83,48 @@ class TestRTMORawExport(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r'\[1, 3, 32, 32\]'):
             self.wrapper(torch.randn(2, 3, 32, 32))
 
-    def test_focus_matches_original_and_exports_as_4d_reshape_transpose(self):
+    def test_export_uses_bounded_channel_slice_ends(self):
+        inputs = torch.randn(1, 3, 32, 32)
+
+        class RawExportOnly(nn.Module):
+
+            def __init__(self, wrapper):
+                super().__init__()
+                self.wrapper = wrapper
+
+            def forward(self, tensor):
+                features = []
+                current = self.wrapper._run_focus(tensor)
+                features.append(current)
+                current = self.wrapper.backbone.stage1(current)
+                features.append(current)
+                outputs = []
+                for feature in features:
+                    outputs.extend(
+                        self.wrapper._split_class_pose_features(feature))
+                return tuple(outputs)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            onnx_path = Path(temporary_directory) / 'raw.onnx'
+            torch.onnx.export(
+                RawExportOnly(self.wrapper),
+                inputs,
+                str(onnx_path),
+                opset_version=9,
+                dynamo=False)
+            graph = onnx.load(str(onnx_path))
+
+        slice_nodes = [node for node in graph.graph.node
+                       if node.op_type == 'Slice']
+        self.assertEqual(len(slice_nodes), 4)
+        for node in slice_nodes:
+            attributes = {
+                attribute.name: onnx.helper.get_attribute_value(attribute)
+                for attribute in node.attribute
+            }
+            self.assertLessEqual(max(attributes['ends']), 8)
+
+    def test_focus_matches_original_and_exports_as_fused_conv(self):
         inputs = torch.randn(1, 3, 8, 8)
         expected = self.wrapper.backbone.stem(inputs)
         actual = self.wrapper._run_focus(inputs)
@@ -110,9 +151,16 @@ class TestRTMORawExport(unittest.TestCase):
         onnx.checker.check_model(graph)
         self.assertEqual(graph.opset_import[0].version, 9)
         operators = [node.op_type for node in graph.graph.node]
-        self.assertNotIn('SpaceToDepth', operators)
-        self.assertEqual(operators.count('Reshape'), 2)
-        self.assertEqual(operators.count('Transpose'), 2)
+        self.assertEqual(operators[0], 'Conv')
+        self.assertNotIn('Reshape', operators)
+        self.assertNotIn('Transpose', operators)
+
+        conv = graph.graph.node[0]
+        attributes = {attribute.name: attribute for attribute in conv.attribute}
+        self.assertEqual(
+            tuple(attributes['kernel_shape'].ints), (7, 7))
+        self.assertEqual(tuple(attributes['strides'].ints), (2, 2))
+        self.assertEqual(tuple(attributes['pads'].ints), (3, 3, 3, 3))
 
     @unittest.skipIf(ort is None, 'ONNX Runtime 未安装，跳过运行时数值对照')
     def test_onnxruntime_focus_matches_original_focus(self):

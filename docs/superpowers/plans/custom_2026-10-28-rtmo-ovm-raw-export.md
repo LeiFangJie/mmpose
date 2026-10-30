@@ -4,7 +4,7 @@
 
 **目标：** 为私有 RTMO-S 建立固定 batch=1、640x640、opset 9 的 OVM 友好 raw-head ONNX 导出路径，并将 neck attention、NMS 与 DCC 解码排除在计算图之外。
 
-**架构：** 让 HybridEncoder 支持空 transformer encoder 配置，SPP 大核以重复 5x5 池化精确分解；训练配置将 RTMO pose branch 改为普通卷积。新增导出 wrapper 使用 SpaceToDepth 和 stem 权重重排保留 Focus 数值行为，直接输出两尺度的 cls、bbox、visibility、pose feature 张量；静态图审计逐项报告算子和 shape。
+**架构：** 让 HybridEncoder 支持空 transformer encoder 配置，SPP 大核以重复 5x5 池化精确分解；训练配置将 RTMO pose branch 改为普通卷积。新增导出 wrapper 将 Focus 重排与 stem 卷积融合为 7x7 首层卷积，保留 Focus 数值行为，直接输出两尺度的 cls、bbox、visibility、pose feature 张量；静态图审计逐项报告算子和 shape。
 
 **技术栈：** PyTorch、MMEngine/MMPose、ONNX opset 9、pytest、ONNX Runtime。
 
@@ -119,9 +119,9 @@
 
 用轻量假的 backbone/neck/head module 构造 wrapper，断言输出 tuple 的 8 个 tensor 均为 4D 且顺序/形状正确；断言固定输入错误时抛出带期望 shape 的 `ValueError`。
 
-- [x] **步骤 2：先添加 SpaceToDepth parity 和 ONNX 测试**
+- [x] **步骤 2：先添加 Focus 融合卷积 parity 和 ONNX 测试**
 
-测试部署 Focus 分支在固定图像上与原 `Focus` 输出 allclose；使用 legacy exporter 导出只含该变换的模块，断言 opset 9 图含 `SpaceToDepth` 节点，而不是动态 Slice/Gather。
+测试部署 Focus 分支在固定图像上与原 `Focus` 输出 allclose；使用 legacy exporter 导出只含该变换的模块，断言 opset 9 图以 7x7 `Conv` 开头且不含首节点 `Transpose`。
 
 - [x] **步骤 3：运行测试确认失败**
 
@@ -131,7 +131,7 @@
 
 - [x] **步骤 4：实现 raw wrapper**
 
-wrapper 固定遍历 CSPDarknet 的 stage；stem 输入使用自定义 autograd `SpaceToDepth` symbolic，forward 将 PixelUnshuffle 结果改排成 ONNX 的空间偏移优先顺序，backward 执行逆变换；建立 stem Conv 副本并按 ONNX 与旧 Focus 的通道次序重排权重。然后调用 neck 和 head module 的原始预测分支，只返回 cls、bbox、kpt visibility、pose feature 两尺度输出，不调用 `RTMOHead.predict()`、NMS 或 DCC。
+wrapper 固定遍历 CSPDarknet 的 stage；部署分支建立 7x7 stem Conv 副本，将原 Focus 的四个空间相位和 3x3 卷积权重映射到 7x7 核中。然后调用 neck 和 head module 的原始预测分支，只返回 cls、bbox、kpt visibility、pose feature 两尺度输出，不调用 `RTMOHead.predict()`、NMS 或 DCC。
 
 - [x] **步骤 5：实现 CLI 导出**
 
@@ -160,7 +160,7 @@ wrapper 固定遍历 CSPDarknet 的 stage；stem 输入使用自定义 autograd 
 
 - [x] **步骤 1：数值对照 raw wrapper 和 head module**
 
-固定随机输入，以 `model.extract_feat(x)` 和 `model.head.head_module(features)` 作为参考，逐项比较 wrapper 的 8 个结果；Focus 输出单独与 SpaceToDepth/权重重排参考比较。
+固定随机输入，以 `model.extract_feat(x)` 和 `model.head.head_module(features)` 作为参考，逐项比较 wrapper 的 8 个结果；Focus 输出单独与融合卷积参考比较。
 
 - [x] **步骤 2：检查 ONNX 图输出契约**
 
@@ -178,13 +178,13 @@ wrapper 固定遍历 CSPDarknet 的 stage；stem 输入使用自定义 autograd 
 
 - 相关回归测试：18 passed。
 - 完整私有配置随机权重 ONNX：opset 9、固定输入和八个 4D 输出均符合约束；移除了 66 个 Identity 节点，未出现手册外算子、NMS/DCC/attention 节点或违规 Conv 分组。
-- ONNX Runtime 与 PyTorch wrapper 最大绝对误差：约 `2.1e-3`；Focus 的 SpaceToDepth 部署路径另有独立数值对照。
+- ONNX Runtime 与 PyTorch wrapper 最大绝对误差：约 `2.1e-3`；Focus 的 7x7 融合卷积部署路径另有独立数值对照。
 - 当前没有使用私有训练 checkpoint；需要训练完成后以实际 checkpoint 再执行导出和审计。
 
 ## 自审记录
 
 - 设计说明覆盖 attention、Focus、SPP、Group=1、DCC/NMS 外置、输出契约和 opset；实施任务逐项覆盖。
-- SpaceToDepth 使用自定义 ONNX symbolic，避免当前 PyTorch `PixelUnshuffle` 自动导出成 Reshape/Transpose 链；ONNX Runtime 回归验证了空间偏移通道次序。
+- 7x7 融合卷积避免当前 PyTorch Focus 导出成首节点 `Transpose`；ONNX Runtime 回归验证了四个空间相位的权重映射。
 - SPP 通过重复 5x5 MaxPool 保持数学等价，避免将池化替成非等价卷积金字塔造成额外精度变化。
 - Group=1 会改变 pose head 参数和计算量，计划明确要求重新初始化/微调并记录资源风险。
 - 按用户要求，本任务验收以手册算子表和 ONNX 静态图/本地数值语义为界，不包含 NPUC 编译。
