@@ -13,7 +13,7 @@
 
 此外，原始网络还有几项与目标算子约束不匹配的结构：
 
-- Focus 的切片拼接可能被导出为不希望出现的 Slice/Gather 组合；
+- Focus 的步长切片在 opset 9 中不能直接导出为带 `steps` 的 Slice；
 - SPP 使用 9x9、13x13 MaxPool，超过手册对 MaxPool 的核大小限制；
 - RTMO pose 分支默认使用分组卷积，组数不符合手册中 Conv 的 Group=1 或 Group=C 限制；
 - PyTorch ONNX 导出器会为共享卷积参数生成多个无计算意义的 Identity 直通节点。
@@ -23,7 +23,7 @@
 本阶段建立一条独立的 `custom_` 导出路径，用于生成可审查的 raw ONNX 图：
 
 1. 关闭 neck attention，仅保留 FPN/PAN 特征融合；
-2. 将 Focus 部署路径导出为 ONNX `SpaceToDepth`，并重排 stem Conv 权重保持数值等价；
+2. 将 Focus 部署路径导出为四维 `Reshape+Transpose+Reshape`，并重排 stem Conv 权重保持数值等价；
 3. 将超过限制的 SPP 大核池化拆分为等效的小核 MaxPool；
 4. 将 pose 分支改为 Group=1；
 5. 直接导出两尺度的分类、框、可见度和 pose feature 原始张量；
@@ -43,7 +43,7 @@
 
 - `Conv` 的分组限制；
 - `MaxPool` 的对称 padding 和最大核大小；
-- `SpaceToDepth`、`Slice`、`Concat`、`Add`、`LeakyRelu`、`Upsample` 等导出算子；
+- `Reshape`、`Transpose`、`Slice`、`Concat`、`Add`、`LeakyRelu`、`Upsample` 等导出算子；
 - `Mul`、`Pad`、`ConvTranspose` 等版本受限算子；
 - opset 9 下不可接受的 `Round` 及图外后处理相关算子。
 
@@ -82,8 +82,8 @@
 - `tools/deploy/rtmo/custom_export_raw_onnx.py`
   - 固定输入为 `[1, 3, 640, 640]`；
   - 固定导出 opset 9，不使用 dynamic axes；
-  - 使用自定义 `SpaceToDepth` symbolic；
-  - 对 stem Conv 权重进行通道重排，匹配 ONNX SpaceToDepth 的空间偏移顺序；
+  - 使用两次四维 `Reshape` 和两次 `Transpose` 完成 Focus 空间到通道的重排；
+  - 对 stem Conv 权重进行通道重排，将导出路径的 `[TL, TR, BL, BR]` 映射到源码的 `[TL, BL, TR, BR]`；
   - 直接调用 head module 的分类、框、可见度和 pose feature 分支；
   - 不调用 `RTMOHead.predict()`，因此 DCC、NMS 和解码不进入图；
   - 导出后自动消除 Identity 节点并重新运行 ONNX checker 和审计。
@@ -107,7 +107,7 @@
 - `docs/superpowers/specs/custom_2026-10-28-rtmo-ovm-raw-export-design.md`
 - `docs/superpowers/plans/custom_2026-10-28-rtmo-ovm-raw-export.md`
 
-测试覆盖 attention 关闭、SPP 等效性、pose 分支分组、Focus/SpaceToDepth 数值一致性、Identity 删除、raw 输出 shape 和算子审计。
+测试覆盖 attention 关闭、SPP 等效性、pose 分支分组、Focus/Reshape-Transpose 数值一致性、Identity 删除、raw 输出 shape 和算子审计。
 
 ## 5. 最终 ONNX 输出契约
 
@@ -166,8 +166,10 @@ Upsample=2
 Slice=4
 Concat=9
 Add=11
-SpaceToDepth=1
-Constant=2
+Constant=4
+Reshape=2
+Transpose=2
+Slice=4
 Identity=0
 ```
 

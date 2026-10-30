@@ -1,0 +1,101 @@
+{
+  "input_shape": [
+    1,
+    3,
+    640,
+    640
+  ],
+  "raw_max_abs_error": {
+    "cls_s16": 9.34600830078125e-05,
+    "bbox_s16": 4.8279762268066406e-05,
+    "vis_s16": 0.0001773834228515625,
+    "pose_s16": 4.982948303222656e-05,
+    "cls_s32": 3.3855438232421875e-05,
+    "bbox_s32": 1.0401010513305664e-05,
+    "vis_s32": 7.218122482299805e-05,
+    "pose_s32": 1.9550323486328125e-05
+  },
+  "raw_max_abs_error_all": 0.0001773834228515625,
+  "raw_relative_error": {
+    "cls_s16": 3.7515663746646464e-06,
+    "bbox_s16": 2.690195635809206e-06,
+    "vis_s16": 2.4404493617778814e-06,
+    "pose_s16": 2.486756652514285e-06,
+    "cls_s32": 2.2302542087724004e-06,
+    "bbox_s32": 2.291949318525318e-06,
+    "vis_s32": 1.8912728804350216e-06,
+    "pose_s32": 1.0671979681383622e-06
+  },
+  "torch_postprocess_instances": 4,
+  "onnx_postprocess_instances": 4,
+  "matches_source_instance_count": true,
+  "source_output": {
+    "bboxes": [
+      4,
+      4
+    ],
+    "scores": [
+      4
+    ],
+    "keypoints": [
+      4,
+      17,
+      2
+    ],
+    "keypoint_scores": [
+      4,
+      17
+    ]
+  },
+  "torch_output": {
+    "bboxes": [
+      4,
+      4
+    ],
+    "scores": [
+      4
+    ],
+    "keypoints": [
+      4,
+      17,
+      2
+    ],
+    "keypoint_scores": [
+      4,
+      17
+    ]
+  },
+  "postprocess_max_abs_error": {
+    "bboxes": 0.0003814697265625,
+    "scores": 2.384185791015625e-07,
+    "keypoints": 0.0009002685546875,
+    "keypoint_scores": 1.0132789611816406e-06
+  },
+  "postprocess_finite_max_abs_error": {
+    "bboxes": 0.0003814697265625,
+    "scores": 2.384185791015625e-07,
+    "keypoints": 0.0009002685546875,
+    "keypoint_scores": 1.0132789611816406e-06
+  },
+  "dcc_probe_max_abs_error": 0.00103759765625,
+  "onnx_output": {
+    "bboxes": [
+      4,
+      4
+    ],
+    "scores": [
+      4
+    ],
+    "keypoints": [
+      4,
+      17,
+      2
+    ],
+    "keypoint_scores": [
+      4,
+      17
+    ]
+  },
+  "onnx": "RTMO\\rtmo_raw.onnx",
+  "dcc_parameters": "RTMO\\custom_rtmo_dcc_params_best250.npz"
+}

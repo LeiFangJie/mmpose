@@ -14,8 +14,7 @@ else:
     ort = None
 
 from mmpose.models.backbones.custom_csp_darknet import Focus
-from tools.deploy.rtmo.custom_export_raw_onnx import (
-    RTMORawExportWrapper, SpaceToDepth)
+from tools.deploy.rtmo.custom_export_raw_onnx import RTMORawExportWrapper
 from tools.deploy.rtmo.custom_onnx_audit import (
     classify_operators, remove_identity_nodes)
 
@@ -84,28 +83,36 @@ class TestRTMORawExport(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r'\[1, 3, 32, 32\]'):
             self.wrapper(torch.randn(2, 3, 32, 32))
 
-    def test_space_to_depth_matches_focus_and_exports_as_opset9_node(self):
+    def test_focus_matches_original_and_exports_as_4d_reshape_transpose(self):
         inputs = torch.randn(1, 3, 8, 8)
         expected = self.wrapper.backbone.stem(inputs)
         actual = self.wrapper._run_focus(inputs)
         self.assertTrue(torch.allclose(actual, expected, atol=1e-6, rtol=1e-6))
 
-        class SpaceToDepthOnly(nn.Module):
+        class FocusOnly(nn.Module):
+
+            def __init__(self, wrapper):
+                super().__init__()
+                self.wrapper = wrapper
 
             def forward(self, tensor):
-                return SpaceToDepth.apply(tensor, 2)
+                return self.wrapper._run_focus(tensor)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
-            onnx_path = Path(temporary_directory) / 'space_to_depth.onnx'
+            onnx_path = Path(temporary_directory) / 'focus.onnx'
             torch.onnx.export(
-                SpaceToDepthOnly(),
+                FocusOnly(self.wrapper),
                 inputs,
                 str(onnx_path),
                 opset_version=9,
                 dynamo=False)
             graph = onnx.load(str(onnx_path))
+        onnx.checker.check_model(graph)
         self.assertEqual(graph.opset_import[0].version, 9)
-        self.assertIn('SpaceToDepth', [node.op_type for node in graph.graph.node])
+        operators = [node.op_type for node in graph.graph.node]
+        self.assertNotIn('SpaceToDepth', operators)
+        self.assertEqual(operators.count('Reshape'), 2)
+        self.assertEqual(operators.count('Transpose'), 2)
 
     @unittest.skipIf(ort is None, 'ONNX Runtime 未安装，跳过运行时数值对照')
     def test_onnxruntime_focus_matches_original_focus(self):

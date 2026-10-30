@@ -16,38 +16,6 @@ from mmpose.registry import MODELS
 from mmpose.utils import register_all_modules
 
 
-class SpaceToDepth(torch.autograd.Function):
-    """将 2x2 空间块重排到通道维，并导出为 ONNX SpaceToDepth。"""
-
-    @staticmethod
-    def forward(ctx, inputs: torch.Tensor, block_size: int):
-        ctx.block_size = block_size
-        batch, channels, height, width = inputs.shape
-        unshuffled = torch.nn.functional.pixel_unshuffle(inputs, block_size)
-        return (unshuffled.reshape(
-            batch, channels, block_size * block_size,
-            height // block_size, width // block_size).permute(
-                0, 2, 1, 3, 4).reshape(
-                    batch, channels * block_size * block_size,
-                    height // block_size, width // block_size))
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        block_size = ctx.block_size
-        batch, expanded_channels, height, width = grad_output.shape
-        channels = expanded_channels // (block_size * block_size)
-        pixel_unshuffle_order = grad_output.reshape(
-            batch, block_size * block_size, channels, height, width).permute(
-                0, 2, 1, 3, 4).reshape(
-                    batch, expanded_channels, height, width)
-        return torch.nn.functional.pixel_shuffle(
-            pixel_unshuffle_order, block_size), None
-
-    @staticmethod
-    def symbolic(graph, inputs, block_size):
-        return graph.op('SpaceToDepth', inputs, blocksize_i=block_size)
-
-
 class RTMORawExportWrapper(nn.Module):
     """固定输入尺寸，直接输出 RTMO head 的四类原始预测张量。
 
@@ -67,12 +35,12 @@ class RTMORawExportWrapper(nn.Module):
 
     @staticmethod
     def _build_focus_conv(focus: nn.Module) -> nn.Module:
-        """复制 Focus 卷积，并将权重改排为 SpaceToDepth 的通道顺序。"""
+        """复制 Focus 卷积，并将权重改排为导出重排的通道顺序。"""
         conv_module = copy.deepcopy(focus.conv)
         conv = conv_module.conv
         in_channels = conv.in_channels // 4
-        # ONNX 的 SpaceToDepth 按空间偏移优先排列，转换成原 Focus 的
-        # [TL, BL, TR, BR] 分组顺序。
+        # 四维 Reshape/Transpose 路径按 [TL, TR, BL, BR] 分组，转换成原
+        # Focus 的 [TL, BL, TR, BR] 分组顺序。
         focus_offset_order = (0, 2, 1, 3)
         order = [focus_offset_order[offset] * in_channels + channel
                  for offset in range(4)
@@ -83,8 +51,15 @@ class RTMORawExportWrapper(nn.Module):
         return conv_module
 
     def _run_focus(self, images: torch.Tensor) -> torch.Tensor:
-        """以 SpaceToDepth 替代 Focus 的切片和拼接。"""
-        return self._focus_conv(SpaceToDepth.apply(images, 2))
+        """用四维 Reshape/Transpose 完成 Focus 的空间到通道重排。"""
+        batch, channels, height, width = images.shape
+        half_height = height // 2
+        half_width = width // 2
+        reordered = images.permute(0, 3, 1, 2).reshape(
+            batch, half_width, 2 * channels * half_height, 2)
+        reordered = reordered.permute(0, 3, 2, 1).reshape(
+            batch, 4 * channels, half_height, half_width)
+        return self._focus_conv(reordered)
 
     @property
     def backbone(self):
