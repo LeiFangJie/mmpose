@@ -239,9 +239,9 @@ class ConvSPPBottleneck(BaseModule):
     def forward(self, x):
         """执行卷积版 SPP 的并行多尺度特征融合。"""
         x = self.conv1(x)
-        with torch.cuda.amp.autocast(enabled=False):
-            x = torch.cat(
-                [x] + [pooling(x) for pooling in self.poolings], dim=1)
+        # 卷积分支需要跟随外层 AMP autocast，避免 Half 输入与 Float 权重冲突。
+        x = torch.cat(
+            [x] + [pooling(x) for pooling in self.poolings], dim=1)
         return self.conv2(x)
 
 
